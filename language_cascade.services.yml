@@ -1,0 +1,12 @@
+services:
+
+  path_processor_alias:
+    class: Drupal\language_cascade\PathProcessor\LanguageCascadePathProcessorAlias
+    tags:
+      - { name: path_processor_inbound, priority: 101 }
+      - { name: path_processor_outbound, priority: 301 }
+    arguments: ['@path.alias_manager', '@language_cascade.language_swapper']
+
+  language_cascade.language_swapper:
+    class: Drupal\language_cascade\LanguageSwapper
+    arguments: ['@language_manager']

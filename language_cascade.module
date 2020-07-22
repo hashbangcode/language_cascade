@@ -1,0 +1,234 @@
+<?php
+
+/**
+ * @file
+ * Contains language_cascade.module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Language\LanguageInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\TypedData\TranslatableInterface;
+use Drupal\Core\Url;
+use Drupal\taxonomy\TermInterface;
+use Drupal\Core\Cache\Cache;
+use Drupal\group\Entity\Group;
+use Drupal\user\Entity\User;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\node\Entity\Node;
+use Drupal\Component\Utility\NestedArray;
+use Drupal\group\Entity\GroupContent;
+use Drupal\language_cascade\LanguageSwapper;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\views\Plugin\views\cache\CachePluginBase;
+use Drupal\views\ViewExecutable;
+use Drupal\views\Plugin\views\query\QueryPluginBase;
+
+/**
+ * Implements hook_page_attachments_alter().
+ */
+function language_cascade_page_attachments_alter(&$attachments) {
+  // Remove default hreflang links coming from core content_translation.
+  foreach ($attachments['#attached']['html_head_link'] as $key => $element) {
+    if (isset($element[0]['hreflang'])) {
+      unset($attachments['#attached']['html_head_link'][$key]);
+    }
+  }
+
+  // Load all enabled languages and add corresponding metatags.
+  $languages = \Drupal::languageManager()->getLanguages(LanguageInterface::STATE_ALL);
+  foreach ($languages as $language) {
+    if ($language->isLocked() === TRUE) {
+      continue;
+    }
+    $hreflang = $language->getId();
+    $url = Url::fromRoute('<current>', [], [
+      'language' => $language,
+      'absolute' => TRUE,
+    ]);
+    $path = $url->toString();
+
+    // On "node/123" paths alias is not picked up but default alias should
+    // always exist, get that and swap it out to mimic an alias path for
+    // current hreflang.
+    if (preg_match('/node\/\d+$/', $path, $output_array)) {
+      $language_swapper = new LanguageSwapper(\Drupal::languageManager());
+      // When the swapped language returns what we passed i.e "fr" that means
+      // there wasn't fallback lang code found and we should call the default.
+      // todo fix that in the swapper.
+      $swapped_language_code = $language_swapper->swapLanguage($hreflang);
+      $lang_code_to_replace = $swapped_language_code == $hreflang ? "en" : $swapped_language_code;
+      $url = Url::fromRoute('<current>', [], [
+        'language' => $languages[$lang_code_to_replace],
+        'absolute' => TRUE,
+      ]);
+      // Check if there is an alias for the swapped language code.
+      $node_id = \Drupal::routeMatch()->getParameter('node')->id();
+      $new_path_alias = \Drupal::service('path.alias_manager')->getAliasByPath('/node/' . $node_id, $lang_code_to_replace);
+      if (preg_match('/node\/\d+$/', $new_path_alias, $output_array)) {
+        $lang_code_to_replace = 'en';
+        // Default to english where there is always an aliased path.
+        $url = Url::fromRoute('<current>', [], [
+          'language' => $languages[$lang_code_to_replace],
+          'absolute' => TRUE,
+        ]);
+        // Reset for next iteration.
+        $new_path_alias = '';
+      }
+      $path = $url->toString();
+      $path = str_replace("/" . $lang_code_to_replace . "/", "/" . $hreflang . "/", $path);
+    }
+
+    // Get rid of /home suffix on homepage url.
+    if (\Drupal::service('path.matcher')->isFrontPage()) {
+      $path = str_replace('/home', '', $path);
+    }
+
+    $attachments['#attached']['html_head'][] = [
+      [
+        '#tag' => 'link',
+        '#attributes' => [
+          'rel' => 'alternate',
+          'hreflang' => $hreflang,
+          'href' => $path,
+        ],
+      ],
+      'language:alternate:' . $hreflang . ':' . $path,
+    ];
+  }
+
+  // Handle canonical url for "node/123" cases too.
+  foreach ($attachments['#attached']['html_head'] as $link_key => $link_attributes) {
+    if (
+      isset($link_attributes[0]['#attributes']['rel']) &&
+      $link_attributes[0]['#attributes']['rel'] == 'canonical' &&
+      preg_match('/node\/\d+$/', $link_attributes[0]['#attributes']['href'], $output_array)
+    ) {
+      // NB: When we set back the language on the canonical url we shouldn't
+      // fallback to the current language for example "/vi-vn" if it was the
+      // accessed path as it may not be the actual translated path but for
+      // example the parent "/vi" or default "/en" language could be
+      // responsible for the translation and that must be retained in the url.
+      $language_swapper = new LanguageSwapper(\Drupal::languageManager());
+      $swapped_language_code = $language_swapper->swapLanguage();
+
+      $url = Url::fromRoute('<current>', [], [
+        'language' => $languages['en'],
+        'absolute' => TRUE,
+      ]);
+      $path = $url->toString();
+      // Finally replace with aliased path aligned with swapped language code.
+      $path = str_replace('/en/', "/" . $swapped_language_code . "/", $path);
+      $attachments['#attached']['html_head'][$link_key][0]['#attributes']['href'] = $path;
+    }
+  }
+}
+
+/**
+ * Implements hook_views_post_render().
+ */
+function language_cascade_views_post_render(ViewExecutable $view, &$output, CachePluginBase $cache) {
+  if (!isset($output["#rows"][0]["#rows"])) {
+    // If no results are found then return here.
+    return;
+  }
+
+  $cascadeFilterPresent = FALSE;
+
+  foreach ($view->filter as $filtername => $plugin) {
+    if ($filtername == 'language_cascade') {
+      $cascadeFilterPresent = TRUE;
+    }
+  }
+
+  if ($cascadeFilterPresent == FALSE) {
+    // Don't do anything if the filter isn't present.
+    return;
+  }
+
+  $languageManager = \Drupal::languageManager();
+  $languageSwapper = \Drupal::service('language_cascade.language_swapper');
+  $currentLangcode = $languageManager->getCurrentLanguage(LanguageInterface::TYPE_URL)->getId();
+
+  foreach ($output["#rows"][0]["#rows"] as $id => $value) {
+    $entity = NULL;
+
+    if (isset($value['#node'])) {
+      $entity = $value['#node'];
+    } elseif (isset($value['#taxonomy_term'])) {
+      $entity = $value['#taxonomy_term'];
+    }
+
+    if (is_null($entity)) {
+      // If no entity was present then skip.
+      continue;
+    }
+
+    if ($entity->language()->getId() != $currentLangcode) {
+      try {
+        // Attempt to load a translation.
+        $translation = $entity->getTranslation($currentLangcode);
+      }
+      catch (\Exception $e) {
+        // The translation failed to load, set this to false.
+        $translation = FALSE;
+      }
+
+      if (!$translation) {
+        // No translation loaded, find the next in the cascade.
+        $newLangcode = $languageSwapper->swapLanguage($currentLangcode);
+        try {
+          $translation = $entity->getTranslation($newLangcode);
+        }
+        catch (\Exception $e) {
+          // The translation failed to load, set this to false.
+          $translation = FALSE;
+        }
+      }
+
+      if (!$translation) {
+        try {
+          // Load the default language (english).
+          $translation = $entity->getTranslation('en');
+        }
+        catch (\Exception $e) {
+          // The translation failed to load, set this to false.
+          $translation = FALSE;
+        }
+      }
+
+      if ($translation) {
+        // If a translation was found then make this the current row.
+        if (isset($value['#node'])) {
+          $value['#node'] = $translation;
+        } elseif (isset($value['#taxonomy_term'])) {
+          $value['#taxonomy_term'] = $translation;
+        }
+
+        $output["#rows"][0]["#rows"][$id] = $value;
+      }
+    }
+  }
+}
+
+/**
+ * Invokes hook_language_fallback_candidates_alter().
+ */
+function language_cascade_language_fallback_candidates_alter(array &$candidates, array $context) {
+  // Don't alter language candidates for entities being viewed through admin
+  // routes. Prevents breaking content listings. But allow language cascade
+  // to work on t() in frontend or admin routes.
+  if ($context['operation'] == 'entity_view' && \Drupal::service('router.admin_context')->isAdminRoute()) {
+    return;
+  }
+
+  // Replace Drupal's default language fallback list with our Language Cascade
+  // sequence.
+  $candidates = [];
+  $language_swapper = new LanguageSwapper(\Drupal::languageManager());
+  $cascade_languages = $language_swapper->lanquageCascadeSequence();
+
+  foreach ($cascade_languages as $language) {
+    $candidates[$language] = $language;
+  }
+}

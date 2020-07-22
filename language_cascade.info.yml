@@ -1,0 +1,9 @@
+name: Language Cascade
+type: module
+description: 'An example of a language cascade module.'
+package: Custom
+core: 8.x
+
+dependencies:
+  - language
+  - content_translation
