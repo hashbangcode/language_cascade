@@ -1,5 +1,5 @@
 # Language Cascade
-This is a proof of concept module that allows a cascade of languages to work.
+This is a proof of concept module for Drupal 8 that allows a cascade of languages to work. That is, content languages 'flow' downstream so that incomplete translations will still show content on the page.
 
 This module is not compatible with Drupal 9.
 
